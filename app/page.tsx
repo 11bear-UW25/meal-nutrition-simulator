@@ -85,6 +85,17 @@ function getWeekDates(anchor: string) {
   })
 }
 
+// 指定された週から前後の週へ移動する
+function shiftWeek(anchor: string, weeks: number) {
+  const [year, month, day] = anchor.split('-').map(Number)  // 日付を年・月・日に分ける
+  const date = new Date(Date.UTC(year, month - 1, day))    // UTCで日付を作成する
+
+  date.setUTCDate(date.getUTCDate() + weeks * 7)            // 指定した週数だけ移動する（１週間分）
+  
+  // YYYY-MM-DD形式で戻す
+  return date.toISOString().slice(0, 10)
+}
+
 function NutritionCard({ meals, selectedMeal }: { meals: Meal[]; selectedMeal: MealType }) {
   const nutrition = useMemo(() => {
     const total = meals.flatMap((meal) => meal.dishes).flatMap((dish) => dish.ingredients).reduce((sum, ingredient) => sum + ingredient.quantity, 0)
@@ -164,6 +175,20 @@ useEffect(() => {
   const [selectedDishId, setSelectedDishId] = useState(1)
   const [newDate, setNewDate] = useState('2024-10-05')
   const [weekAnchor, setWeekAnchor] = useState('2024-10-01')
+  useEffect(() => {
+    const today = new Date()  // パソコンやスマートフォンの現在の日付を取得
+    // 年月日をそれぞれ取得
+    const year = today.getFullYear()
+    const month = String(today.getMonth() + 1). padStart(2, '0')
+    const day = String(today.getDate()).padStart(2, '0')
+    // YYYY-MM-DD形式に
+    const todayString = `${year}-${month}-${day}`
+
+    setSelectedDate(todayString) // 選択中の日付を今日に
+    setWeekAnchor(todayString)   // 週間カレンダーに今日を含む週を表示
+    setNewDate(todayString)      // 新しい献立を作成するときの初期日付を今日に 
+  }, [])
+
   const meals = plans[selectedDate] ?? mealTypes.map((type) => ({ type, dishes: [] }))
   const weekDates = getWeekDates(weekAnchor)
   const selectedMealData = meals.find((meal) => meal.type === selectedMeal) ?? meals[0]
@@ -183,7 +208,21 @@ useEffect(() => {
   }
   function savePlan() { setEditing(false); setPlans((current) => ({ ...current, [selectedDate]: meals })) }
   function selectDate(date: string) { setSelectedDate(date); setEditing(false); setSelectedMeal('朝食') }
+  // 今日の日付を取得し、週間カレンダーを今週に戻す
+  function goToThisWeek() {
+    const today = new Date() //  端末の現在の日付を取得
+    // 年・月・日をYYYY-MM-DD形式に
+    const year = today.getFullYear()
+    const month = String(today.getMonth() + 1).padStart(2, '0')
+    const day = String(today.getDate()).padStart(2, '0')
 
+    const todayString = `${year}-${month}-${day}`
+
+    // 今週を含む週に異動
+    setWeekAnchor(todayString)
+    // 選択中の日付も今日に戻す
+    setSelectedDate(todayString)
+  }
   return (
   <main className="min-h-screen bg-[#f6f8f3] text-[#29352c]">
     <header className="border-b border-[#e0e8dc] bg-[#fbfcf8]">
@@ -229,15 +268,33 @@ useEffect(() => {
                 <h2 className="mt-1 text-lg font-bold text-[#27382b]">週間カレンダー
                 </h2>
               </div>
-              <div className="flex gap-1">
-                <button onClick={() => setWeekAnchor(weekDates[0])} aria-label="前の週" className="rounded-md p-2 text-[#718774] hover:bg-[#eef5ed]">
+              <div className="flex items-center gap-1">
+                {/* 今週に戻るボタン */}
+                <button
+                  onClick={goToThisWeek}
+                  className="rounded-md border border-[#b8ceb9] px-3 py-1.5 text-xs font-semibold text-[#4c7451] hover:bg-[#eef5ed]"
+                >
+                  今週
+                </button>
+                {/* 1週間前へ移動 */}
+                <button
+                  onClick={() => setWeekAnchor((current) => shiftWeek(current, -1))}
+                  aria-label="前の週"
+                  className="rounded-md p-2 text-[#718774] hover:bg-[#eef5ed]"
+                >
                   <ChevronLeft size={18} />
                 </button>
-                <button onClick={() => setWeekAnchor(weekDates[6])} aria-label="次の週" className="rounded-md p-2 text-[#718774] hover:bg-[#eef5ed]">
+                {/* 1週間後へ移動 */}
+                <button
+                  onClick={() => setWeekAnchor((current) => shiftWeek(current, 1))}
+                  aria-label="次の週"
+                  className="rounded-md p-2 text-[#718774] hover:bg-[#eef5ed]"
+                >
                   <ChevronRight size={18} />
                 </button>
               </div>
             </div>
+            {/* 週間カレンダーの日付一覧 */}
             <div className="grid grid-cols-7 gap-2 overflow-x-auto pb-1">
               {weekDates.map((date) => { const dayMeals = plans[date] ?? []; const day = new Date(`${date}T00:00:00`).getDate(); const weekday = new Intl.DateTimeFormat('ja-JP', { weekday: 'short' }).format(new Date(`${date}T00:00:00`)); return (
               <button key={date} onClick={() => selectDate(date)} className={`min-w-[74px] rounded-lg border p-2 text-left transition ${date === selectedDate ? 'border-[#79a17c] bg-[#edf6ec] shadow-sm' : 'border-[#e8eee6] bg-[#fcfdfb] hover:border-[#bdd3be]'}`}>
@@ -246,7 +303,8 @@ useEffect(() => {
                     {weekday}
                   </span>
                   <span className="text-lg font-bold text-[#36543b]">
-                    {day}
+                     {/* 毎月1日は「月/日」で表示し、それ以外は「日」だけ表示 */}
+                    {day === 1 ? `${Number(date.slice(5, 7))}/${day}` : day}  
                   </span>
                 </div>
                 <div className="mt-3 flex flex-col gap-1 text-[10px] text-[#6c7f6d]">
