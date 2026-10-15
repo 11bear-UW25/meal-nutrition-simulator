@@ -14,7 +14,6 @@ import {
   CirclePlus,
   Clock3,
   FileText,
-  Leaf,
   Minus,
   Pencil,
   Plus,
@@ -32,7 +31,7 @@ type FoodData = {
   id: string           // id: 食品を識別するためのID
   name: string          // name: 食品名
   energy: number        // ～saltまで: 食品100gあたりの栄養価
-  protein: number 
+  protein: number
   fat: number
   carbohydrate: number
   fiber: number
@@ -85,45 +84,243 @@ function getWeekDates(anchor: string) {
   })
 }
 
-// 指定された週から前後の週へ移動する
+// 指定された週から前後の週へ移動
 function shiftWeek(anchor: string, weeks: number) {
   const [year, month, day] = anchor.split('-').map(Number)  // 日付を年・月・日に分ける
-  const date = new Date(Date.UTC(year, month - 1, day))    // UTCで日付を作成する
+  const date = new Date(Date.UTC(year, month - 1, day))    // UTCで日付を作成
 
-  date.setUTCDate(date.getUTCDate() + weeks * 7)            // 指定した週数だけ移動する（１週間分）
-  
+  date.setUTCDate(date.getUTCDate() + weeks * 7)            // 指定した週数だけ移動（１週間分）
+
   // YYYY-MM-DD形式で戻す
   return date.toISOString().slice(0, 10)
 }
 
-function NutritionCard({ meals, selectedMeal }: { meals: Meal[]; selectedMeal: MealType }) {
+// 献立データとSupabaseから取得した食品データを受け取る
+function NutritionCard({
+  meals,
+  selectedMeal,
+  foods,
+  loadingFoods,
+  foodsError,
+}: {
+  meals: Meal[]             //献立データ
+  selectedMeal: MealType    // 選択中の食事区分
+  foods: FoodData[]         // 取得した食品データ
+  loadingFoods: boolean     // 食品データ取得中かどうか
+  foodsError: string | null // 食品データ取得中に発生したエラー
+}) {
+  // 栄養価の表示範囲を管理…all: 1日全体、 meal: 選択中の食事
+  const [nutritionView, setNutritionView] = useState<'all' | 'meal'>('all')
+  // 栄養価を表示する食事区分を管理
+  const [nutritionMeal, setNutritionMeal] = useState<MealType>(selectedMeal)
+
+  // 献立編集画面で選択中の食事区分が変わったら、栄養価表示側も合わせる
+  useEffect(() => {
+    setNutritionMeal(selectedMeal)
+  }, [selectedMeal])
+
+  // 栄養価を計算
   const nutrition = useMemo(() => {
-    const total = meals.flatMap((meal) => meal.dishes).flatMap((dish) => dish.ingredients).reduce((sum, ingredient) => sum + ingredient.quantity, 0)
-    return [
-      Math.round(total * 2.14),
-      Math.round(total * 0.18 * 10) / 10,
-      Math.round(total * 0.08 * 10) / 10,
-      Math.round(total * 0.24 * 10) / 10,
-      Math.round(total * 0.035 * 10) / 10,
-      Math.round(total * 0.012 * 10) / 10,
-    ]
-  }, [meals])
+    // 6種類の栄養価を0で初期化
+    const totals = {
+      energy: 0,
+      protein: 0,
+      fat: 0,
+      carbohydrate: 0,
+      fiber: 0,
+      salt: 0,
+    }
+  // 表示モードに応じて計算対象の食事を決める
+  const targetMeals =
+    nutritionView === 'all'
+    ? meals
+    : meals.filter((meal) => meal.type === nutritionMeal)
+  // 選択された表示範囲の食事だけを計算
+  for (const meal of targetMeals) {
+    // 各食事に登録されている料理を確認
+    for (const dish of meal.dishes) {
+      // 各料理に登録されている食材を確認
+      for (const ingredient of dish.ingredients) {
+        // 食品が未選択の場合は栄養価を計算しない
+        if (!ingredient.name) {
+          continue
+        }
+        //  食材名からSupabaseの食品データを探す
+        const food = foods.find(
+          (item) => item.name === ingredient.name
+        )
+        // 食品データが見つからなかった場合はスキップ
+        if (!food) {
+          continue
+        }
+        // 100gあたりの栄養価を使用量に換算する
+        const ratio = ingredient.quantity / 100
+        totals.energy += food.energy * ratio // エネルギー（kcal）
+        totals.protein += food.protein * ratio // たんぱく質（g）
+        totals.fat += food.fat * ratio // 脂質（g）
+        totals.carbohydrate += food.carbohydrate * ratio // 炭水化物（g）
+        totals.fiber += food.fiber * ratio // 食物繊維（g）
+        totals.salt += food.salt *ratio // 食塩相当量（g）
+      }
+    }
+  }
+  // 表示用に小数点を整理
+  return [
+    Math.round(totals.energy),
+    Math.round(totals.protein * 10) / 10,
+    Math.round(totals.fat * 10) / 10,
+    Math.round(totals.carbohydrate * 10) / 10,
+    Math.round(totals.fiber * 10) / 10,
+    Math.round(totals.salt * 10) / 10,
+  ]
+  // 献立または食品データが変わったときに再計算
+}, [meals, foods, nutritionView, nutritionMeal])
+
+// Supabaseの食品データに存在しない食材を確認
+const missingFoodNames = useMemo(() => {
+  // 食品データがまだない場合は、ここでは判定しない
+  if (foods.length === 0) {
+    return []
+  }
+
+  // 現在表示している食事を判定対象に
+  const targetMeals =
+  nutritionView === 'all'
+    ? meals
+    : meals.filter((meal) => meal.type === nutritionMeal)
+
+  // 対象の食事に含まれる食材名をすべて取得
+  const ingredientNames = targetMeals
+    .flatMap((meal) =>meal.dishes)
+    .flatMap((dish) => dish.ingredients)
+    .map((ingredient) => ingredient.name)
+    .filter((name) => name !== '') // 未選択の食材は警告対象から除外
+
+  // 対象の食事に含まれる食材名をすべて取得
+  const missingNames = ingredientNames.filter(
+    (name) => !foods.some((food) => food.name === name)
+  )
+  return [...new Set(missingNames)]   // 同じ食材名が複数ある場合は、重複を取り除く
+}, [meals, foods, nutritionView, nutritionMeal])
 
   return (
     <section className="rounded-xl border border-[#dfe9df] bg-white p-5 shadow-[0_2px_10px_rgba(41,74,48,0.04)]">
       <div className="mb-4 flex items-center justify-between">
         <div><p className="text-xs font-semibold tracking-[0.16em] text-[#6c866e]">NUTRITION</p><h2 className="mt-1 text-lg font-bold text-[#27382b]">栄養価シミュレーション</h2></div>
-        <span className="rounded-full bg-[#edf5ec] px-3 py-1 text-xs font-semibold text-[#5b795e]">計算中</span>
       </div>
+      {/* 栄養価の表示範囲を切り替える */}
       <div className="mb-4 flex gap-2 rounded-lg bg-[#f5f8f3] p-1">
-        <button className="flex-1 rounded-md bg-white py-2 text-sm font-semibold text-[#355c3d] shadow-sm">1日全体</button>
-        <button className="flex-1 rounded-md py-2 text-sm text-[#6d7e70]">{selectedMeal}</button>
+
+        {/* 1日全体の栄養価を表示 */}
+        <button
+          onClick={() => setNutritionView('all')}
+          className={`flex-1 rounded-md bg-white py-2 text-sm ${
+            nutritionView === 'all'
+            ? 'bg-white font-semibold text-[#355c3d] shadow-sm'
+            : 'text-[#6d7e70]'
+          }`}
+        >
+          1日全体
+        </button>
+
+        {/* 食事別の栄養価を表示 */}
+        <button
+          onClick={() => setNutritionView('meal')}
+          className={`flex-1 rounded-md py-2 text-sm ${
+            nutritionView === 'meal'
+            ? 'bg-white font-semibold text-[#355c3d] shadow-sm'
+            : 'text-[#6d7e70]'
+          }`}
+        >
+          食事別
+        </button>
       </div>
+
+      {/* 食事別を選択したときに、栄養価を表示する食事区分を選ぶ */}
+      {nutritionView === 'meal' && (
+        <div className="mb-4 grid grid-cols-4 gap-1 rounded-lg bg-[#f5f8f3] p-1">
+          {mealTypes.map((mealType) => (
+            <button
+              key={mealType}
+              onClick={() => setNutritionMeal(mealType)}
+              aria-pressed={nutritionMeal === mealType}
+              className={`rounded-md py-2 text-xs ${
+                nutritionMeal === mealType
+                  ? 'bg-white font-semibold text-[#355c3d] shadow-sm'
+                  : 'text-[#6d7e70]'
+              }`}
+            >
+              {mealType}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* 食品データを読み込んでいる間だけメッセージを表示 */}
+      {loadingFoods && (
+        <p
+          role='status'
+          className="mb-4 rounded-lg bg-[#f5f8f3] p-3 text-sm text-[#6d7e70]"
+        >
+          食品データを読み込んでいます…
+        </p>
+      )}
+
+      {/* 食品データの取得に失敗した場合はエラーを表示 */}
+      {foodsError && (
+        <p
+          role="alert"
+          className="mb-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-800"
+        >
+          {foodsError}
+          <span className="mt-1 block">
+            栄養価の計算ができません。ページを再読み込みしてください。
+          </span>
+        </p>
+      )}
+
+      {/* 6種類の栄養価を2列で表示 */}
       <div className="grid grid-cols-2 gap-3">
-        {nutritionLabels.map(([key, label, unit], index) => <div key={key} className="rounded-lg border border-[#e7eee5] bg-[#fbfdfb] p-3"><p className="text-xs text-[#77877a]">{label}</p><p className="mt-1 text-xl font-bold text-[#2d4932]">{nutrition[index]}<span className="ml-1 text-xs font-normal text-[#829084]">{unit}</span></p></div>)}
+        {nutritionLabels.map(([key, label, unit], index) => (
+          <div
+            key={key}
+            className="rounded-lg border border-[#e7eee5] bg-[#fbfdfb] p-3"
+          >
+             {/* 栄養素の名前を表示 */}
+            <p className="text-xs text-[#77877a]">
+              {label}
+            </p>
+            {/* 読み込み中・エラー時は数値の代わりに「—」を表示 */}
+            <p className="mt-1 text-xl font-bold text-[#2d4932]">
+              {loadingFoods || foodsError ? '-': nutrition [index]}
+
+              {/* 計算できている場合だけ単位を表示する */}
+              {!loadingFoods && !foodsError &&(
+                <span className="ml-1 text-xs font-nomal text-[#829084]">
+                  {unit}
+                </span>
+              )}
+            </p>
+          </div>
+        ))}
       </div>
-      <button className="mt-4 flex w-full items-center justify-center gap-2 rounded-lg border border-[#b5ceb8] py-2.5 text-sm font-semibold text-[#47734d] transition hover:bg-[#f0f7ef]"><Leaf size={15} />栄養価を再計算</button>
-    </section>
+
+      {/* 計算対象外の食材がある場合だけ注意を表示 */}
+      {missingFoodNames.length > 0 && (
+      <p
+        role="alert"
+        className="mt-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-800"
+      >
+      {/* 計算に含まれなかった食材名を表示 */}
+      計算対象外の食材：{missingFoodNames.join('、')}
+
+      <span className="mt-1 block">
+        食品データに見つからなかったため、
+        これらの食材は栄養価の合計に含まれていません。
+      </span>
+    </p>
+  )}
+  </section>
   )
 }
 
@@ -186,7 +383,7 @@ useEffect(() => {
 
     setSelectedDate(todayString) // 選択中の日付を今日に
     setWeekAnchor(todayString)   // 週間カレンダーに今日を含む週を表示
-    setNewDate(todayString)      // 新しい献立を作成するときの初期日付を今日に 
+    setNewDate(todayString)      // 新しい献立を作成するときの初期日付を今日に
   }, [])
 
   const meals = plans[selectedDate] ?? mealTypes.map((type) => ({ type, dishes: [] }))
@@ -204,7 +401,8 @@ useEffect(() => {
   }
   function addIngredient() {
     if (!selectedDish) return
-    updateCurrent((current) => current.map((meal) => meal.type === selectedMeal ? { ...meal, dishes: meal.dishes.map((dish) => dish.id === selectedDish.id ? { ...dish, ingredients: [...dish.ingredients, { name: '食パン', quantity: 50 }] } : dish) } : meal))
+    // 新しい食材は、食品を選択するまで未選択の状態にする
+    updateCurrent((current) => current.map((meal) => meal.type === selectedMeal ? { ...meal, dishes: meal.dishes.map((dish) => dish.id === selectedDish.id ? { ...dish, ingredients: [...dish.ingredients, { name: '', quantity: 50 }] } : dish) } : meal))
   }
   function savePlan() { setEditing(false); setPlans((current) => ({ ...current, [selectedDate]: meals })) }
   function selectDate(date: string) { setSelectedDate(date); setEditing(false); setSelectedMeal('朝食') }
@@ -223,6 +421,7 @@ useEffect(() => {
     // 選択中の日付も今日に戻す
     setSelectedDate(todayString)
   }
+
   return (
   <main className="min-h-screen bg-[#f6f8f3] text-[#29352c]">
     <header className="border-b border-[#e0e8dc] bg-[#fbfcf8]">
@@ -236,12 +435,7 @@ useEffect(() => {
             </h1>
             <p className="hidden text-xs text-[#7a8a7d] sm:block">献立を考える時間を、もっと心地よく。
             </p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2 text-xs text-[#789078]">
-          <span className="hidden sm:inline">プロトタイプ
-          </span>
-          <span className="size-2 rounded-full bg-[#7ba67e]" />
+            </div>
         </div>
       </div>
     </header>
@@ -304,7 +498,7 @@ useEffect(() => {
                   </span>
                   <span className="text-lg font-bold text-[#36543b]">
                      {/* 毎月1日は「月/日」で表示し、それ以外は「日」だけ表示 */}
-                    {day === 1 ? `${Number(date.slice(5, 7))}/${day}` : day}  
+                    {day === 1 ? `${Number(date.slice(5, 7))}/${day}` : day}
                   </span>
                 </div>
                 <div className="mt-3 flex flex-col gap-1 text-[10px] text-[#6c7f6d]">
@@ -368,7 +562,14 @@ useEffect(() => {
                 </button>
               </div>
             </section>
-            <NutritionCard meals={meals} selectedMeal={selectedMeal} />
+            {/* 献立と食品データを栄養価表示コンポーネントへ渡す */}
+            <NutritionCard
+              meals={meals}
+              selectedMeal={selectedMeal}
+              foods={foods}
+              loadingFoods={loadingFoods}
+              foodsError={foodsError}
+            />
             <section className="rounded-xl border border-[#dfe9df] bg-white p-5">
               <div className="mb-4 flex items-center justify-between">
                 <div>
@@ -443,7 +644,13 @@ useEffect(() => {
                   </button>)}
                 </div>
               </section>
-              <NutritionCard meals={meals} selectedMeal={selectedMeal} />
+              <NutritionCard
+                meals={meals}
+                selectedMeal={selectedMeal}
+                foods={foods}
+                loadingFoods={loadingFoods}
+                foodsError={foodsError}
+              />
             </div>
             <section className="rounded-xl border border-[#dfe9df] bg-white p-5">
               <div className="flex flex-col justify-between gap-3 border-b border-[#edf1eb] pb-5 sm:flex-row sm:items-start">
@@ -486,6 +693,8 @@ useEffect(() => {
                     {selectedDish.ingredients.map((ingredient, index) =>
                     <div key={`${ingredient.name}-${index}`} className="flex items-center gap-2">
                       <select value={ingredient.name} onChange={(event) => updateCurrent((current) => current.map((meal) => meal.type === selectedMeal ? { ...meal, dishes: meal.dishes.map((dish) => dish.id === selectedDish.id ? { ...dish, ingredients: dish.ingredients.map((item, itemIndex) => itemIndex === index ? { ...item, name: event.target.value } : item) } : dish) } : meal))} className="min-w-0 flex-1 rounded-lg border border-[#d7e3d5] bg-white px-3 py-2.5 text-sm text-[#455a47] outline-none focus:border-[#719d76]">
+                        {/* 食品を選択するまで未選択の状態を表示する */}
+                        <option value="">食品を選択してください</option>
                         {/* Supabaseから取得した食品一覧を選択肢として表示する */}
                         {foods.map((food) => (
                           <option key={food.id} value={food.name}>
