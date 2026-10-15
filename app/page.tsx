@@ -3,7 +3,8 @@
 // useEffect: 画面が表示された後にデータ取得などの処理を実行
 // useMemo: 計算結果を必要に応じて再利用
 // useState: 画面で使用するデータを管理
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { ensureSupabaseSession, supabase } from '@/lib/supabase'
 import {
   ArrowLeft,
   ArrowRight,
@@ -37,10 +38,11 @@ type FoodData = {
   fiber: number
   salt: number
 }
-type Dish = { id: number; name: string; ingredients: Ingredient[] }
+type Dish = { id: number | string; name: string; ingredients: Ingredient[] }
 type Meal = { type: MealType; dishes: Dish[] }
 
 const mealTypes: MealType[] = ['朝食', '昼食', 'おやつ', '夕食']
+const emptyMeals = (): Meal[] => mealTypes.map((type) => ({ type, dishes: [] }))
 const nutritionLabels = [
   ['energy', 'エネルギー', 'kcal'],
   ['protein', 'たんぱく質', 'g'],
@@ -50,17 +52,29 @@ const nutritionLabels = [
   ['salt', '食塩相当量', 'g'],
 ] as const
 
-const initialMeals: Meal[] = [
-  { type: '朝食', dishes: [{ id: 1, name: 'トーストと目玉焼き', ingredients: [{ name: '食パン', quantity: 60 }, { name: '卵', quantity: 50 }, { name: 'バター', quantity: 5 }] }] },
-  { type: '昼食', dishes: [{ id: 2, name: '鶏むね肉のサラダ', ingredients: [{ name: '鶏むね肉', quantity: 100 }, { name: 'ブロッコリー', quantity: 50 }] }] },
-  { type: 'おやつ', dishes: [{ id: 3, name: 'ヨーグルト', ingredients: [{ name: 'ヨーグルト', quantity: 100 }] }] },
-  { type: '夕食', dishes: [{ id: 4, name: '肉じゃが', ingredients: [{ name: '鶏むね肉', quantity: 120 }, { name: 'じゃがいも', quantity: 150 }, { name: '玉ねぎ', quantity: 60 }, { name: 'にんじん', quantity: 40 }] }] },
-]
+// 端末の現在日付を、日付入力と同じ形式で取得する
+function getTodayDate() {
+  const today = new Date()
+  const year = today.getFullYear()
+  const month = String(today.getMonth() + 1).padStart(2, '0')
+  const day = String(today.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
 
-const seedPlans: Record<string, Meal[]> = {
-  '2024-10-01': initialMeals,
-  '2024-10-02': initialMeals.map((meal) => ({ ...meal, dishes: meal.type === '夕食' ? [{ ...meal.dishes[0], name: '鮭の塩焼き' }] : [] })),
-  '2024-10-04': initialMeals.map((meal) => ({ ...meal, dishes: meal.type === '朝食' ? [{ ...meal.dishes[0], name: '納豆ごはん' }] : [] })),
+// 指定月から前後した月の1日を取得する
+function getMonthStart(date: string, offset = 0) {
+  const [year, month] = date.split('-').map(Number)
+  const monthStart = new Date(Date.UTC(year, month - 1 + offset, 1))
+  return monthStart.toISOString().slice(0, 10)
+}
+
+// 日付に対応する年月を日本語で表示する
+function formatJapaneseMonth(date: string) {
+  return new Intl.DateTimeFormat('ja-JP', {
+    year: 'numeric',
+    month: 'long',
+    timeZone: 'UTC',
+  }).format(new Date(`${date}T00:00:00Z`))
 }
 
 function formatJapaneseDate(date: string) {
@@ -325,7 +339,20 @@ const missingFoodNames = useMemo(() => {
 }
 
 export default function Page() {
-  const [selectedDate, setSelectedDate] = useState('2024-10-01')
+  const [selectedDate, setSelectedDate] = useState(getTodayDate)
+  const [plans, setPlans] = useState<Record<string, Meal[]>>({})
+  const [savedPlanDates, setSavedPlanDates] = useState<Set<string>>(new Set())
+  const loadedPlanDates = useRef(new Set<string>())
+  const editedPlanDates = useRef(new Set<string>())
+  const planRequestId = useRef(0)
+  const [authReady, setAuthReady] = useState(false)
+  const [authError, setAuthError] = useState<string | null>(null)
+  const [authRetry, setAuthRetry] = useState(0)
+  const [planLoading, setPlanLoading] = useState(false)
+  const [planError, setPlanError] = useState<string | null>(null)
+  const [planRetry, setPlanRetry] = useState(0)
+  const [savingPlan, setSavingPlan] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
   // Supabaseから取得した食品一覧を保存
   // 最初はデータがないため、空の配列で初期化
   const [foods, setFoods] = useState<FoodData[]>([])
@@ -366,32 +393,208 @@ useEffect(() => {
   fetchFoods()
 }, [])
 
-  const [plans, setPlans] = useState(seedPlans)
   const [editing, setEditing] = useState(false)
   const [selectedMeal, setSelectedMeal] = useState<MealType>('朝食')
-  const [selectedDishId, setSelectedDishId] = useState(1)
-  const [newDate, setNewDate] = useState('2024-10-05')
-  const [weekAnchor, setWeekAnchor] = useState('2024-10-01')
-  useEffect(() => {
-    const today = new Date()  // パソコンやスマートフォンの現在の日付を取得
-    // 年月日をそれぞれ取得
-    const year = today.getFullYear()
-    const month = String(today.getMonth() + 1). padStart(2, '0')
-    const day = String(today.getDate()).padStart(2, '0')
-    // YYYY-MM-DD形式に
-    const todayString = `${year}-${month}-${day}`
+  const [selectedDishId, setSelectedDishId] = useState<number | string>(1)
+  const [newDate, setNewDate] = useState(getTodayDate)
+  const [weekAnchor, setWeekAnchor] = useState(getTodayDate)
 
-    setSelectedDate(todayString) // 選択中の日付を今日に
-    setWeekAnchor(todayString)   // 週間カレンダーに今日を含む週を表示
-    setNewDate(todayString)      // 新しい献立を作成するときの初期日付を今日に
-  }, [])
-
-  const meals = plans[selectedDate] ?? mealTypes.map((type) => ({ type, dishes: [] }))
+  const meals = plans[selectedDate] ?? emptyMeals()
   const weekDates = getWeekDates(weekAnchor)
+  const visibleWeekKey = weekDates.join(',')
   const selectedMealData = meals.find((meal) => meal.type === selectedMeal) ?? meals[0]
   const selectedDish = selectedMealData?.dishes.find((dish) => dish.id === selectedDishId) ?? selectedMealData?.dishes[0]
 
+  // 既存セッションを再利用し、なければ匿名ユーザーを作成する
+  useEffect(() => {
+    let active = true
+
+    async function initializeAuth() {
+      try {
+        await ensureSupabaseSession()
+        if (active) {
+          setAuthError(null)
+          setAuthReady(true)
+        }
+      } catch (error) {
+        console.error('匿名認証エラー', error)
+        if (active) {
+          setAuthError(error instanceof Error ? error.message : '認証に失敗しました')
+        }
+      }
+    }
+
+    initializeAuth()
+    return () => {
+      active = false
+    }
+  }, [authRetry])
+
+  // 表示中の週と選択日について、認証後に保存済み献立を読み込む
+  useEffect(() => {
+    if (!authReady || loadingFoods) {
+      return
+    }
+
+    const requestedDates = [...new Set([...weekDates, selectedDate])]
+    const datesToLoad = requestedDates.filter((date) => !loadedPlanDates.current.has(date))
+
+    if (datesToLoad.length === 0) {
+      return
+    }
+
+    const requestId = ++planRequestId.current
+    let active = true
+    setPlanLoading(true)
+    setPlanError(null)
+
+    async function loadPlans() {
+      try {
+        if (foodsError) {
+          throw new Error('食品一覧を取得できないため、献立の読み込みを完了できません')
+        }
+
+        const { data: planData, error: planQueryError } = await supabase
+          .from('menu_plans')
+          .select('id, target_date')
+          .in('target_date', datesToLoad)
+
+        if (planQueryError) {
+          throw planQueryError
+        }
+
+        const planRows = planData ?? []
+        const mealsByDate = new Map(datesToLoad.map((date) => [date, emptyMeals()]))
+        const dateByPlanId = new Map(planRows.map((plan) => [plan.id, plan.target_date]))
+        const planIds = planRows.map((plan) => plan.id)
+
+        if (planIds.length > 0) {
+          const { data: slotData, error: slotQueryError } = await supabase
+            .from('meal_slots')
+            .select('id, menu_plan_id, meal_type')
+            .in('menu_plan_id', planIds)
+
+          if (slotQueryError) {
+            throw slotQueryError
+          }
+
+          const slotRows = slotData ?? []
+          const slotById = new Map(slotRows.map((slot) => [slot.id, slot]))
+          const slotIds = slotRows.map((slot) => slot.id)
+
+          if (slotIds.length > 0) {
+            const { data: itemData, error: itemQueryError } = await supabase
+              .from('menu_items')
+              .select('id, meal_slot_id, dish_name')
+              .in('meal_slot_id', slotIds)
+
+            if (itemQueryError) {
+              throw itemQueryError
+            }
+
+            const itemRows = itemData ?? []
+            const dishByItemId = new Map<string, Dish>()
+
+            for (const item of itemRows) {
+              const slot = slotById.get(item.meal_slot_id)
+              const date = slot ? dateByPlanId.get(slot.menu_plan_id) : undefined
+              const meal = mealsByDate.get(date ?? '')
+
+              if (!slot || !date || !meal || !mealTypes.includes(slot.meal_type as MealType)) {
+                throw new Error('保存済み献立の食事区分または関連データが正しくありません')
+              }
+
+              const dish: Dish = {
+                id: item.id,
+                name: item.dish_name,
+                ingredients: [],
+              }
+              meal.find((entry) => entry.type === slot.meal_type)?.dishes.push(dish)
+              dishByItemId.set(item.id, dish)
+            }
+
+            const itemIds = itemRows.map((item) => item.id)
+            if (itemIds.length > 0) {
+              const { data: ingredientData, error: ingredientQueryError } = await supabase
+                .from('menu_item_ingredients')
+                .select('menu_item_id, ingredient_id, quantity, unit')
+                .in('menu_item_id', itemIds)
+
+              if (ingredientQueryError) {
+                throw ingredientQueryError
+              }
+
+              for (const row of ingredientData ?? []) {
+                const dish = dishByItemId.get(row.menu_item_id)
+                const food = foods.find((entry) => entry.id === row.ingredient_id)
+
+                if (!dish || !food) {
+                  throw new Error('保存済み献立に食品一覧から確認できない食材があります')
+                }
+
+                dish.ingredients.push({
+                  name: food.name,
+                  quantity: Number(row.quantity),
+                })
+              }
+            }
+          }
+        }
+
+        if (!active || requestId !== planRequestId.current) {
+          return
+        }
+
+        // 読み込み中に編集された日付は、画面上の変更を上書きしない
+        setPlans((current) => {
+          const next = { ...current }
+          for (const date of datesToLoad) {
+            if (!editedPlanDates.current.has(date)) {
+              next[date] = mealsByDate.get(date) ?? emptyMeals()
+            }
+          }
+          return next
+        })
+
+        for (const date of datesToLoad) {
+          loadedPlanDates.current.add(date)
+        }
+
+        const datesWithPlans = new Set(planRows.map((plan) => plan.target_date))
+        setSavedPlanDates((current) => {
+          const next = new Set(current)
+          for (const date of datesToLoad) {
+            if (datesWithPlans.has(date)) {
+              next.add(date)
+            } else {
+              next.delete(date)
+            }
+          }
+          return next
+        })
+      } catch (error) {
+        console.error('献立読み込みエラー', error)
+        if (active && requestId === planRequestId.current) {
+          setPlanError(error instanceof Error ? error.message : '献立を読み込めませんでした')
+        }
+      } finally {
+        if (active && requestId === planRequestId.current) {
+          setPlanLoading(false)
+        }
+      }
+    }
+
+    loadPlans()
+    return () => {
+      active = false
+      if (requestId === planRequestId.current) {
+        setPlanLoading(false)
+      }
+    }
+  }, [authReady, foods, foodsError, loadingFoods, planRetry, selectedDate, visibleWeekKey])
+
   function updateCurrent(updater: (current: Meal[]) => Meal[]) {
+    editedPlanDates.current.add(selectedDate)
     setPlans((current) => ({ ...current, [selectedDate]: updater(current[selectedDate] ?? mealTypes.map((type) => ({ type, dishes: [] }))) }))
   }
   function addDish() {
@@ -404,8 +607,83 @@ useEffect(() => {
     // 新しい食材は、食品を選択するまで未選択の状態にする
     updateCurrent((current) => current.map((meal) => meal.type === selectedMeal ? { ...meal, dishes: meal.dishes.map((dish) => dish.id === selectedDish.id ? { ...dish, ingredients: [...dish.ingredients, { name: '', quantity: 50 }] } : dish) } : meal))
   }
-  function savePlan() { setEditing(false); setPlans((current) => ({ ...current, [selectedDate]: meals })) }
-  function selectDate(date: string) { setSelectedDate(date); setEditing(false); setSelectedMeal('朝食') }
+  // 食品名を食品IDに変換して、原子的な保存用DB関数を呼び出す
+  async function savePlan() {
+    const dateToSave = selectedDate
+    const mealsToSave = meals
+    setSavingPlan(true)
+    setSaveError(null)
+
+    try {
+      await ensureSupabaseSession()
+
+      const mealsPayload = mealsToSave.map((meal) => ({
+        type: meal.type,
+        dishes: meal.dishes.map((dish) => {
+          if (!dish.name.trim()) {
+            throw new Error('料理名を入力してください')
+          }
+
+          return {
+            name: dish.name.trim(),
+            ingredients: dish.ingredients.map((ingredient) => {
+              if (!ingredient.name) {
+                throw new Error('食品を選択してください')
+              }
+
+              const food = foods.find((entry) => entry.name === ingredient.name)
+              if (!food) {
+                throw new Error(`食品一覧にない食材は保存できません: ${ingredient.name}`)
+              }
+
+              if (!Number.isFinite(ingredient.quantity) || ingredient.quantity <= 0) {
+                throw new Error(`使用量を正しく入力してください: ${ingredient.name}`)
+              }
+
+              return {
+                ingredient_id: food.id,
+                quantity: ingredient.quantity,
+                unit: 'g',
+              }
+            }),
+          }
+        }),
+      }))
+
+      const { data, error } = await supabase.rpc('save_menu_plan_atomic_v1', {
+        p_target_date: dateToSave,
+        p_meals: mealsPayload,
+      })
+
+      if (error) {
+        throw error
+      }
+      if (!data) {
+        throw new Error('献立の保存結果を確認できませんでした')
+      }
+
+      // 古い読み込み要求が保存内容を上書きしないよう、この日付を編集済みとして保持する
+      loadedPlanDates.current.add(dateToSave)
+      editedPlanDates.current.add(dateToSave)
+      setPlans((current) => ({ ...current, [dateToSave]: mealsToSave }))
+      setSavedPlanDates((current) => new Set(current).add(dateToSave))
+      setPlanError(null)
+      setEditing(false)
+    } catch (error) {
+      console.error('献立保存エラー', error)
+      setSaveError(error instanceof Error ? error.message : '献立を保存できませんでした')
+    } finally {
+      setSavingPlan(false)
+    }
+  }
+
+  function selectDate(date: string) {
+    setSelectedDate(date)
+    setWeekAnchor(date)
+    setEditing(false)
+    setSelectedMeal('朝食')
+    setSaveError(null)
+  }
   // 今日の日付を取得し、週間カレンダーを今週に戻す
   function goToThisWeek() {
     const today = new Date() //  端末の現在の日付を取得
@@ -440,6 +718,37 @@ useEffect(() => {
       </div>
     </header>
     <div className="mx-auto max-w-[1440px] px-5 py-6 md:px-10 md:py-8">
+      {authError && (
+        <p role="alert" className="mb-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-800">
+          {authError}
+          <button
+            onClick={() => {
+              setAuthReady(false)
+              setAuthRetry((retry) => retry + 1)
+            }}
+            className="ml-3 font-semibold underline"
+          >
+            再試行
+          </button>
+        </p>
+      )}
+      {!authReady && !authError && (
+        <p role="status" className="mb-4 text-sm text-[#718274]">認証を準備しています…</p>
+      )}
+      {planError && (
+        <p role="alert" className="mb-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-800">
+          {planError}
+          <button
+            onClick={() => setPlanRetry((retry) => retry + 1)}
+            className="ml-3 font-semibold underline"
+          >
+            再読み込み
+          </button>
+        </p>
+      )}
+      {planLoading && (
+        <p role="status" className="mb-4 text-sm text-[#718274]">保存済みの献立を読み込んでいます…</p>
+      )}
       <div className="mb-6 flex flex-col justify-between gap-4 md:flex-row md:items-end">
         <div>
           <p className="text-sm font-semibold text-[#718274]">WELCOME BACK
@@ -521,7 +830,7 @@ useEffect(() => {
                   {formatJapaneseDate(selectedDate)}の献立
                 </h2>
               </div>
-              {plans[selectedDate] &&
+              {savedPlanDates.has(selectedDate) &&
               <button onClick={() => setEditing(true)} className="flex items-center gap-2 rounded-lg border border-[#b8ceb9] px-3 py-2 text-sm font-semibold text-[#4c7451] hover:bg-[#f0f7ef]">
                 <Pencil size={15} />編集
               </button>}
@@ -541,8 +850,8 @@ useEffect(() => {
                   </span>}
                 </span>
               </button>)}
-            </div>{!plans[selectedDate] &&
-            <button onClick={() => setEditing(true)} className="mt-4 flex w-full items-center justify-center gap-2 rounded-lg bg-[#547d59] py-3 text-sm font-semibold text-white hover:bg-[#466b4b]">
+            </div>{!savedPlanDates.has(selectedDate) &&
+            <button onClick={() => setEditing(true)} disabled={!authReady || planLoading || !loadedPlanDates.current.has(selectedDate)} className="mt-4 flex w-full items-center justify-center gap-2 rounded-lg bg-[#547d59] py-3 text-sm font-semibold text-white hover:bg-[#466b4b] disabled:cursor-not-allowed disabled:opacity-50">
               <Plus size={17} />この日付で献立を作成
             </button>}
           </section>
@@ -558,7 +867,7 @@ useEffect(() => {
             </p>
             <div className="mt-4 flex gap-2">
               <input type="date" value={newDate} onChange={(event) => setNewDate(event.target.value)} className="min-w-0 flex-1 rounded-lg border border-[#cbdcca] bg-white px-3 py-2.5 text-sm text-[#405443] outline-none focus:border-[#719d76]" />
-                <button onClick={() => { setSelectedDate(newDate); setEditing(true); setSelectedMeal('朝食') }} className="rounded-lg bg-[#547d59] px-4 py-2 text-sm font-semibold text-white hover:bg-[#466b4b]">Go
+                <button onClick={() => { setSelectedDate(newDate); setWeekAnchor(newDate); setEditing(true); setSelectedMeal('朝食'); setSaveError(null) }} disabled={!authReady} className="rounded-lg bg-[#547d59] px-4 py-2 text-sm font-semibold text-white hover:bg-[#466b4b] disabled:cursor-not-allowed disabled:opacity-50">Go
                 </button>
               </div>
             </section>
@@ -580,18 +889,26 @@ useEffect(() => {
                 </div>
                 <FileText size={18} className="text-[#91aa94]" />
               </div>
-              <div className="flex gap-2">{['2024年10月', '2024年9月', '2024年8月'].map((month, index) =>
-                <button key={month} onClick={() => index === 0 && selectDate('2024-10-01')} className={`flex-1 rounded-lg px-2 py-3 text-xs font-semibold ${index === 0 ? 'bg-[#eef6ed] text-[#4b7651]' : 'bg-[#fafcf9] text-[#91a092]'}`}>
-                  {month}
-                </button>)}
+              <div className="flex gap-2">{[0, -1, -2].map((offset) => {
+                const monthStart = getMonthStart(selectedDate, offset)
+                return (
+                  <button
+                    key={monthStart}
+                    onClick={() => selectDate(monthStart)}
+                    className={`flex-1 rounded-lg px-2 py-3 text-xs font-semibold ${offset === 0 ? 'bg-[#eef6ed] text-[#4b7651]' : 'bg-[#fafcf9] text-[#91a092]'}`}
+                  >
+                    {formatJapaneseMonth(monthStart)}
+                  </button>
+                )
+              })}
               </div>
               <div className="mt-4 flex items-center justify-between border-t border-[#edf1eb] pt-4 text-sm">
-                <button className="flex items-center gap-1 text-[#78927b]">
+                <button onClick={() => selectDate(getMonthStart(selectedDate, -1))} className="flex items-center gap-1 text-[#78927b]">
                   <ChevronLeft size={15} />前月
                 </button>
-                <span className="font-bold text-[#4c644f]">2024年10月
+                <span className="font-bold text-[#4c644f]">{formatJapaneseMonth(selectedDate)}
                 </span>
-                <button className="flex items-center gap-1 text-[#78927b]">次月
+                <button onClick={() => selectDate(getMonthStart(selectedDate, 1))} className="flex items-center gap-1 text-[#78927b]">次月
                   <ChevronRight size={15} />
                 </button>
               </div>
@@ -606,8 +923,8 @@ useEffect(() => {
             <button onClick={() => setEditing(false)} className="flex items-center gap-2 text-sm font-semibold text-[#557458]">
               <ArrowLeft size={17} />戻る
             </button>
-            <button onClick={savePlan} className="flex items-center gap-2 rounded-lg bg-[#547d59] px-4 py-2 text-sm font-semibold text-white hover:bg-[#466b4b]">
-              <Save size={16} />保存
+            <button onClick={savePlan} disabled={!authReady || savingPlan || loadingFoods || !!foodsError || !loadedPlanDates.current.has(selectedDate)} className="flex items-center gap-2 rounded-lg bg-[#547d59] px-4 py-2 text-sm font-semibold text-white hover:bg-[#466b4b] disabled:cursor-not-allowed disabled:opacity-50">
+              <Save size={16} />{savingPlan ? '保存中…' : '保存'}
             </button>
           </div>
         </header>
@@ -619,6 +936,11 @@ useEffect(() => {
               {formatJapaneseDate(selectedDate)}の献立
             </h2>
           </div>
+          {saveError && (
+            <p role="alert" className="mb-5 rounded-lg bg-amber-50 p-3 text-sm text-amber-800">
+              {saveError}
+            </p>
+          )}
           <div className="grid gap-6 xl:grid-cols-[minmax(260px,0.7fr)_minmax(0,1.5fr)]">
             <div className="space-y-6">
               <section className="rounded-xl border border-[#dfe9df] bg-white p-4">
