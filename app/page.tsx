@@ -82,6 +82,95 @@ function formatJapaneseDate(date: string) {
   return new Intl.DateTimeFormat('ja-JP', { month: 'long', day: 'numeric', weekday: 'short' }).format(parsed)
 }
 
+// RLSで取得できる指定日の献立を画面用データに変換する
+async function fetchPlanForDate(date: string, foods: FoodData[]): Promise<Meal[] | null> {
+  const { data: plan, error: planError } = await supabase
+    .from('menu_plans')
+    .select('id')
+    .eq('target_date', date)
+    .maybeSingle()
+
+  if (planError) {
+    throw planError
+  }
+  if (!plan) {
+    return null
+  }
+
+  const { data: slots, error: slotsError } = await supabase
+    .from('meal_slots')
+    .select('id, meal_type')
+    .eq('menu_plan_id', plan.id)
+
+  if (slotsError) {
+    throw slotsError
+  }
+
+  const result = emptyMeals()
+  const slotRows = slots ?? []
+  const slotIds = slotRows.map((slot) => slot.id)
+  if (slotIds.length === 0) {
+    return result
+  }
+
+  const { data: items, error: itemsError } = await supabase
+    .from('menu_items')
+    .select('id, meal_slot_id, dish_name')
+    .in('meal_slot_id', slotIds)
+
+  if (itemsError) {
+    throw itemsError
+  }
+
+  const itemRows = items ?? []
+  const dishById = new Map<string, Dish>()
+  const slotById = new Map(slotRows.map((slot) => [slot.id, slot]))
+
+  for (const item of itemRows) {
+    const slot = slotById.get(item.meal_slot_id)
+    if (!slot || !mealTypes.includes(slot.meal_type as MealType)) {
+      throw new Error('保存済み献立の食事区分が正しくありません')
+    }
+
+    const dish: Dish = {
+      id: item.id,
+      name: item.dish_name,
+      ingredients: [],
+    }
+    result.find((meal) => meal.type === slot.meal_type)?.dishes.push(dish)
+    dishById.set(item.id, dish)
+  }
+
+  const itemIds = itemRows.map((item) => item.id)
+  if (itemIds.length === 0) {
+    return result
+  }
+
+  const { data: ingredients, error: ingredientsError } = await supabase
+    .from('menu_item_ingredients')
+    .select('menu_item_id, ingredient_id, quantity')
+    .in('menu_item_id', itemIds)
+
+  if (ingredientsError) {
+    throw ingredientsError
+  }
+
+  for (const ingredient of ingredients ?? []) {
+    const dish = dishById.get(ingredient.menu_item_id)
+    const food = foods.find((item) => item.id === ingredient.ingredient_id)
+    if (!dish || !food) {
+      throw new Error('保存済み献立に食品一覧から確認できない食材があります')
+    }
+
+    dish.ingredients.push({
+      name: food.name,
+      quantity: Number(ingredient.quantity),
+    })
+  }
+
+  return result
+}
+
 function getWeekDates(anchor: string) {
   const [year, month, day] = anchor.split("-").map(Number)
   const date = new Date(Date.UTC(year, month - 1, day))
@@ -353,6 +442,12 @@ export default function Page() {
   const [planRetry, setPlanRetry] = useState(0)
   const [savingPlan, setSavingPlan] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
+  const [deletingPlan, setDeletingPlan] = useState(false)
+  const [deleteError, setDeleteError] = useState<{ date: string; message: string } | null>(null)
+  const [reuseSourceDate, setReuseSourceDate] = useState(getTodayDate)
+  const [reuseTargetDate, setReuseTargetDate] = useState(getTodayDate)
+  const [reuseLoading, setReuseLoading] = useState(false)
+  const [reuseError, setReuseError] = useState<string | null>(null)
   // Supabaseから取得した食品一覧を保存
   // 最初はデータがないため、空の配列で初期化
   const [foods, setFoods] = useState<FoodData[]>([])
@@ -454,92 +549,12 @@ useEffect(() => {
           throw new Error('食品一覧を取得できないため、献立の読み込みを完了できません')
         }
 
-        const { data: planData, error: planQueryError } = await supabase
-          .from('menu_plans')
-          .select('id, target_date')
-          .in('target_date', datesToLoad)
-
-        if (planQueryError) {
-          throw planQueryError
-        }
-
-        const planRows = planData ?? []
-        const mealsByDate = new Map(datesToLoad.map((date) => [date, emptyMeals()]))
-        const dateByPlanId = new Map(planRows.map((plan) => [plan.id, plan.target_date]))
-        const planIds = planRows.map((plan) => plan.id)
-
-        if (planIds.length > 0) {
-          const { data: slotData, error: slotQueryError } = await supabase
-            .from('meal_slots')
-            .select('id, menu_plan_id, meal_type')
-            .in('menu_plan_id', planIds)
-
-          if (slotQueryError) {
-            throw slotQueryError
-          }
-
-          const slotRows = slotData ?? []
-          const slotById = new Map(slotRows.map((slot) => [slot.id, slot]))
-          const slotIds = slotRows.map((slot) => slot.id)
-
-          if (slotIds.length > 0) {
-            const { data: itemData, error: itemQueryError } = await supabase
-              .from('menu_items')
-              .select('id, meal_slot_id, dish_name')
-              .in('meal_slot_id', slotIds)
-
-            if (itemQueryError) {
-              throw itemQueryError
-            }
-
-            const itemRows = itemData ?? []
-            const dishByItemId = new Map<string, Dish>()
-
-            for (const item of itemRows) {
-              const slot = slotById.get(item.meal_slot_id)
-              const date = slot ? dateByPlanId.get(slot.menu_plan_id) : undefined
-              const meal = mealsByDate.get(date ?? '')
-
-              if (!slot || !date || !meal || !mealTypes.includes(slot.meal_type as MealType)) {
-                throw new Error('保存済み献立の食事区分または関連データが正しくありません')
-              }
-
-              const dish: Dish = {
-                id: item.id,
-                name: item.dish_name,
-                ingredients: [],
-              }
-              meal.find((entry) => entry.type === slot.meal_type)?.dishes.push(dish)
-              dishByItemId.set(item.id, dish)
-            }
-
-            const itemIds = itemRows.map((item) => item.id)
-            if (itemIds.length > 0) {
-              const { data: ingredientData, error: ingredientQueryError } = await supabase
-                .from('menu_item_ingredients')
-                .select('menu_item_id, ingredient_id, quantity, unit')
-                .in('menu_item_id', itemIds)
-
-              if (ingredientQueryError) {
-                throw ingredientQueryError
-              }
-
-              for (const row of ingredientData ?? []) {
-                const dish = dishByItemId.get(row.menu_item_id)
-                const food = foods.find((entry) => entry.id === row.ingredient_id)
-
-                if (!dish || !food) {
-                  throw new Error('保存済み献立に食品一覧から確認できない食材があります')
-                }
-
-                dish.ingredients.push({
-                  name: food.name,
-                  quantity: Number(row.quantity),
-                })
-              }
-            }
-          }
-        }
+        const loadedPlans = await Promise.all(
+          datesToLoad.map(async (date) => ({
+            date,
+            meals: await fetchPlanForDate(date, foods),
+          })),
+        )
 
         if (!active || requestId !== planRequestId.current) {
           return
@@ -548,22 +563,28 @@ useEffect(() => {
         // 読み込み中に編集された日付は、画面上の変更を上書きしない
         setPlans((current) => {
           const next = { ...current }
-          for (const date of datesToLoad) {
+          for (const { date, meals: loadedMeals } of loadedPlans) {
             if (!editedPlanDates.current.has(date)) {
-              next[date] = mealsByDate.get(date) ?? emptyMeals()
+              next[date] = loadedMeals ?? emptyMeals()
             }
           }
           return next
         })
 
-        for (const date of datesToLoad) {
+        for (const { date } of loadedPlans) {
           loadedPlanDates.current.add(date)
         }
 
-        const datesWithPlans = new Set(planRows.map((plan) => plan.target_date))
+        const datesWithPlans = new Set(
+          loadedPlans.filter((plan) => plan.meals !== null).map((plan) => plan.date),
+        )
         setSavedPlanDates((current) => {
           const next = new Set(current)
           for (const date of datesToLoad) {
+            // 削除や編集後に完了した古い読み込みで、現在の状態を上書きしない
+            if (editedPlanDates.current.has(date)) {
+              continue
+            }
             if (datesWithPlans.has(date)) {
               next.add(date)
             } else {
@@ -677,12 +698,129 @@ useEffect(() => {
     }
   }
 
+  // 確認後に削除RPCを呼び、成功した場合だけ画面の献立を空にする
+  async function deletePlan() {
+    const dateToDelete = selectedDate
+    if (!window.confirm(`${formatJapaneseDate(dateToDelete)}の献立と、登録されている料理・食材をすべて削除します。この操作は取り消せません。よろしいですか？`)) {
+      return
+    }
+
+    setDeletingPlan(true)
+    setDeleteError(null)
+
+    try {
+      await ensureSupabaseSession()
+      const { data, error } = await supabase.rpc('delete_menu_plan_atomic_v1', {
+        p_target_date: dateToDelete,
+      })
+
+      if (error) {
+        throw error
+      }
+      if (data !== true) {
+        throw new Error(data === false
+          ? '削除対象の献立が見つかりませんでした。表示を更新して確認してください。'
+          : '献立の削除結果を確認できませんでした')
+      }
+
+      // 古い読み込み結果が削除済みの献立を復活させないようにする
+      loadedPlanDates.current.add(dateToDelete)
+      editedPlanDates.current.add(dateToDelete)
+      setPlans((current) => ({ ...current, [dateToDelete]: emptyMeals() }))
+      setSavedPlanDates((current) => {
+        const next = new Set(current)
+        next.delete(dateToDelete)
+        return next
+      })
+      setPlanError(null)
+    } catch (error) {
+      console.error('献立全体の削除エラー', error)
+      setDeleteError({
+        date: dateToDelete,
+        message: error instanceof Error ? error.message : '献立を削除できませんでした',
+      })
+    } finally {
+      setDeletingPlan(false)
+    }
+  }
+
+  // 保存済み献立を別の日付の編集画面へコピーする
+  async function reusePlan() {
+    if (reuseSourceDate === reuseTargetDate) {
+      setReuseError('コピー元とコピー先には別の日付を指定してください')
+      return
+    }
+
+    setReuseLoading(true)
+    setReuseError(null)
+
+    try {
+      if (!authReady) {
+        throw new Error('認証の準備が完了していません')
+      }
+      if (loadingFoods || foodsError) {
+        throw new Error('食品データの読み込みが完了してから再利用してください')
+      }
+
+      await ensureSupabaseSession()
+      const sourceMeals = await fetchPlanForDate(reuseSourceDate, foods)
+      if (!sourceMeals) {
+        throw new Error(`${reuseSourceDate} に保存済みの献立がありません`)
+      }
+
+      const targetMeals = await fetchPlanForDate(reuseTargetDate, foods)
+      if (targetMeals && !window.confirm(
+        `${reuseTargetDate} にはすでに献立があります。コピー先の編集内容を置き換えますか？保存するまでは、Supabase上の献立は変更されません。`,
+      )) {
+        return
+      }
+
+      // 料理IDだけ新しくし、料理名・食材・使用量・食事区分を複製する
+      let nextDishId = Date.now()
+      const copiedMeals = sourceMeals.map((meal) => ({
+        ...meal,
+        dishes: meal.dishes.map((dish) => ({
+          ...dish,
+          id: nextDishId++,
+          ingredients: dish.ingredients.map((ingredient) => ({ ...ingredient })),
+        })),
+      }))
+
+      loadedPlanDates.current.add(reuseTargetDate)
+      editedPlanDates.current.add(reuseTargetDate)
+      setPlans((current) => ({ ...current, [reuseTargetDate]: copiedMeals }))
+      setSavedPlanDates((current) => {
+        const next = new Set(current)
+        if (targetMeals) {
+          next.add(reuseTargetDate)
+        } else {
+          next.delete(reuseTargetDate)
+        }
+        return next
+      })
+      setSelectedDate(reuseTargetDate)
+      setWeekAnchor(reuseTargetDate)
+      setSelectedMeal('朝食')
+      setSelectedDishId(copiedMeals.find((meal) => meal.type === '朝食')?.dishes[0]?.id ?? 0)
+      setSaveError(null)
+      setEditing(true)
+    } catch (error) {
+      console.error('献立の再利用エラー', error)
+      setReuseError(error instanceof Error ? error.message : '献立を再利用できませんでした')
+    } finally {
+      setReuseLoading(false)
+    }
+  }
+
   function selectDate(date: string) {
     setSelectedDate(date)
     setWeekAnchor(date)
+    setReuseSourceDate(date)
     setEditing(false)
     setSelectedMeal('朝食')
     setSaveError(null)
+    setDeleteError(null)
+    setReuseError(null)
   }
   // 今日の日付を取得し、週間カレンダーを今週に戻す
   function goToThisWeek() {
@@ -831,10 +969,24 @@ useEffect(() => {
                 </h2>
               </div>
               {savedPlanDates.has(selectedDate) &&
-              <button onClick={() => setEditing(true)} className="flex items-center gap-2 rounded-lg border border-[#b8ceb9] px-3 py-2 text-sm font-semibold text-[#4c7451] hover:bg-[#f0f7ef]">
-                <Pencil size={15} />編集
-              </button>}
+              <div className="flex items-center gap-2">
+                <button onClick={() => setEditing(true)} className="flex items-center gap-2 rounded-lg border border-[#b8ceb9] px-3 py-2 text-sm font-semibold text-[#4c7451] hover:bg-[#f0f7ef]">
+                  <Pencil size={15} />編集
+                </button>
+                <button
+                  onClick={deletePlan}
+                  disabled={!authReady || deletingPlan || planLoading}
+                  className="flex items-center gap-2 rounded-lg border border-[#e2bdb8] px-3 py-2 text-sm font-semibold text-[#a95e56] hover:bg-[#fff1ef] disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Trash2 size={15} />{deletingPlan ? '削除中…' : '献立全体を削除'}
+                </button>
+              </div>}
             </div>
+            {deleteError?.date === selectedDate && (
+              <p role="alert" className="mb-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-800">
+                {deleteError.message}
+              </p>
+            )}
             <div className="grid gap-3 sm:grid-cols-2">
               {meals.map((meal) =>
               <button key={meal.type} onClick={() => { setSelectedMeal(meal.type); setEditing(true); setSelectedDishId(meal.dishes[0]?.id ?? 0) }} className="flex min-h-[88px] flex-col justify-between rounded-lg border border-[#e5ece3] bg-[#fbfdfb] p-4 text-left hover:border-[#aac8ad]">
@@ -870,6 +1022,45 @@ useEffect(() => {
                 <button onClick={() => { setSelectedDate(newDate); setWeekAnchor(newDate); setEditing(true); setSelectedMeal('朝食'); setSaveError(null) }} disabled={!authReady} className="rounded-lg bg-[#547d59] px-4 py-2 text-sm font-semibold text-white hover:bg-[#466b4b] disabled:cursor-not-allowed disabled:opacity-50">Go
                 </button>
               </div>
+            </section>
+            {/* 保存済み献立を別の日付へコピーし、保存前に編集できるようにする */}
+            <section className="rounded-xl border border-[#dfe9df] bg-white p-5">
+              <h2 className="font-bold text-[#2e4532]">献立を再利用</h2>
+              <p className="mt-2 text-sm leading-relaxed text-[#6c806d]">
+                保存済み献立をコピー先の日付の編集画面に複製します。内容を確認してから保存してください。
+              </p>
+              <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                <label className="text-xs font-semibold text-[#67806b]">
+                  コピー元の日付
+                  <input
+                    type="date"
+                    value={reuseSourceDate}
+                    onChange={(event) => setReuseSourceDate(event.target.value)}
+                    className="mt-1 w-full rounded-lg border border-[#cbdcca] bg-white px-3 py-2.5 text-sm font-normal text-[#405443] outline-none focus:border-[#719d76]"
+                  />
+                </label>
+                <label className="text-xs font-semibold text-[#67806b]">
+                  コピー先の日付
+                  <input
+                    type="date"
+                    value={reuseTargetDate}
+                    onChange={(event) => setReuseTargetDate(event.target.value)}
+                    className="mt-1 w-full rounded-lg border border-[#cbdcca] bg-white px-3 py-2.5 text-sm font-normal text-[#405443] outline-none focus:border-[#719d76]"
+                  />
+                </label>
+              </div>
+              {reuseError && (
+                <p role="alert" className="mt-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-800">
+                  {reuseError}
+                </p>
+              )}
+              <button
+                onClick={reusePlan}
+                disabled={!authReady || reuseLoading || loadingFoods || !!foodsError}
+                className="mt-4 w-full rounded-lg border border-[#b8ceb9] py-2.5 text-sm font-semibold text-[#4c7451] hover:bg-[#f0f7ef] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {reuseLoading ? '献立を読み込んでいます…' : 'コピーして編集'}
+              </button>
             </section>
             {/* 献立と食品データを栄養価表示コンポーネントへ渡す */}
             <NutritionCard
