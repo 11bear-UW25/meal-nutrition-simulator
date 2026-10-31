@@ -1,5 +1,10 @@
+
 import { Analytics } from '@vercel/analytics/next'
 import type { Metadata, Viewport } from 'next'
+
+// 新しく作成した認証メニューを読み込む
+import AuthNavigation from '@/components/auth-navigation'
+
 import './globals.css'
 
 export const metadata: Metadata = {
@@ -17,8 +22,18 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="ja">
-      <body className="antialiased">{children}{process.env.NODE_ENV === 'production' && <Analytics />}</body>
+      <body className="antialiased">
+
+        {/* 全ページ共通の認証メニュー */}
+        <AuthNavigation />
+
+        {/* 各ページの内容 */}
+        {children}
+
+        {/* 本番環境の場合だけアクセス解析を有効にする */}
+        {process.env.NODE_ENV === 'production' && <Analytics />}
+
+      </body>
     </html>
   )
 }
-
