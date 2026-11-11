@@ -441,6 +441,7 @@ export default function Page() {
   const [planError, setPlanError] = useState<string | null>(null)
   const [planRetry, setPlanRetry] = useState(0)
   const [savingPlan, setSavingPlan] = useState(false)
+  const [cancelingEdit, setCancelingEdit] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [deletingPlan, setDeletingPlan] = useState(false)
   const [deleteError, setDeleteError] = useState<{ date: string; message: string } | null>(null)
@@ -613,6 +614,57 @@ useEffect(() => {
       }
     }
   }, [authReady, foods, foodsError, loadingFoods, planRetry, selectedDate, visibleWeekKey])
+
+  // 保存せずに戻る場合、Supabaseの保存済みデータで画面を元に戻す
+  async function cancelEditing() {
+    if (savingPlan || cancelingEdit) return
+
+    const dateToRestore = selectedDate
+    setCancelingEdit(true)
+    setSaveError(null)
+
+    try {
+      await ensureSupabaseSession()
+
+      // 保存済みの献立を保存する (未保存ならnullが返る)
+      const savedMeals = await fetchPlanForDate(dateToRestore, foods)
+
+      // 古い読み込み処理いよる上書きを防ぐ
+      loadedPlanDates.current.add(dateToRestore)
+      editedPlanDates.current.add(dateToRestore)
+
+      // 画面上の未保存データを破棄する
+      setPlans((current) => ({
+        ...current,
+        [dateToRestore]: savedMeals ?? emptyMeals(),
+      }))
+
+      // 保存済みかどうかの表示を正しく戻す
+      setSavedPlanDates((current) => {
+        const next = new Set(current)
+
+        if (savedMeals) {
+          next.add(dateToRestore)
+        } else {
+          next.delete(dateToRestore)
+        }
+
+        return next
+      })
+
+      // 復元できた場合だけ編集画面を閉じる
+      setEditing(false)
+    } catch (error) {
+      console.error('編集取り消しエラー', error)
+      setSaveError(
+        error instanceof Error
+        ? `変更を取り消せませんでした: ${error.message}`
+        : '変更を取り消せませんでした'
+      )
+    } finally {
+      setCancelingEdit(false)
+    }
+  }
 
   function updateCurrent(updater: (current: Meal[]) => Meal[]) {
     editedPlanDates.current.add(selectedDate)
@@ -1111,11 +1163,28 @@ useEffect(() => {
       <div className="fixed inset-0 z-10 overflow-y-auto bg-[#f6f8f3]">
         <header className="border-b border-[#e0e8dc] bg-[#fbfcf8]">
           <div className="mx-auto flex max-w-[1440px] items-center justify-between px-5 py-4 md:px-10">
-            <button onClick={() => setEditing(false)} className="flex items-center gap-2 text-sm font-semibold text-[#557458]">
-              <ArrowLeft size={17} />戻る
+            <button
+              onClick={cancelEditing}
+              disabled={savingPlan || cancelingEdit}
+              className="flex items-center gap-2 text-sm font-semibold text-[#557458] disabled:cursor-allowed disabled:opacity-50"
+            >
+              <ArrowLeft size={17} />
+              {cancelingEdit ? '戻っています…' : '戻る'}
             </button>
-            <button onClick={savePlan} disabled={!authReady || savingPlan || loadingFoods || !!foodsError || !loadedPlanDates.current.has(selectedDate)} className="flex items-center gap-2 rounded-lg bg-[#547d59] px-4 py-2 text-sm font-semibold text-white hover:bg-[#466b4b] disabled:cursor-not-allowed disabled:opacity-50">
-              <Save size={16} />{savingPlan ? '保存中…' : '保存'}
+            <button
+              onClick={savePlan}
+              disabled={
+                !authReady ||
+                savingPlan ||
+                cancelingEdit ||
+                loadingFoods ||
+                !!foodsError ||
+                !loadedPlanDates.current.has(selectedDate)
+              }
+              className="flex items-center gap-2 rounded-lg bg-[#547d59] px-4 py-2 text-sm font-semibold text-white hover:bg-[#466b4b] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Save size={16} />
+              {savingPlan ? '保存中…' : '保存'}
             </button>
           </div>
         </header>
